@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+.pycache/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.log
