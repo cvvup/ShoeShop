@@ -1,5 +1,7 @@
 # ООО «Обувь»
 
+[![Maintainability](https://qlty.sh/gh/cvvup/projects/ShoeShop/maintainability.svg)](https://qlty.sh/gh/cvvup/projects/ShoeShop)
+
 Учебное приложение на Python и SQLite, выполненное по ТЗ практического задания.
 
 Приложение реализует:

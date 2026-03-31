@@ -4,21 +4,26 @@ from __future__ import annotations
 import argparse
 import base64
 import html
+import importlib
 import secrets
 import shutil
 import sqlite3
 import subprocess
 import urllib.parse
 import webbrowser
-import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timedelta
 from http import cookies
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from wsgiref.simple_server import WSGIServer, make_server
+from typing import Callable
 
 
+try:
+    ET = importlib.import_module("defusedxml.ElementTree")
+except ImportError:
+    ET = importlib.import_module("xml.etree.ElementTree")
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCES_DIR = BASE_DIR / "resources"
 IMPORT_DIR = RESOURCES_DIR / "import"
@@ -26,6 +31,32 @@ IMAGES_DIR = RESOURCES_DIR / "product_images"
 DB_PATH = BASE_DIR / "shoe_store.db"
 SCHEMA_PATH = BASE_DIR / "schema.sql"
 SESSIONS: dict[str, dict[str, object]] = {}
+PLACEHOLDER_IMAGE = "picture.png"
+MEDIA_PREFIX = "/media/"
+LOGIN_PATH = "/login"
+PRODUCTS_PATH = "/products"
+ORDERS_PATH = "/orders"
+FORBIDDEN_STATUS = "403 Forbidden"
+FORBIDDEN_BODY = "<div class='panel'>Нет доступа.</div>"
+FORBIDDEN_TEXT = "Нет доступа."
+PRODUCT_ITEM_MESSAGE_PREFIX = "/products?message="
+ORDER_ITEM_MESSAGE_PREFIX = "/orders?message="
+ROLE_GUEST = "Гость"
+ROLE_CLIENT = "Авторизированный клиент"
+ROLE_MANAGER = "Менеджер"
+ROLE_ADMIN = "Администратор"
+MANAGER_ROLES = {ROLE_MANAGER, ROLE_ADMIN}
+ADMIN_ONLY = {ROLE_ADMIN}
+LOOKUP_TABLES = {
+    "roles",
+    "suppliers",
+    "manufacturers",
+    "categories",
+    "order_statuses",
+}
+BSDTAR_PATH = shutil.which("bsdtar") or "/usr/bin/bsdtar"
+SIPS_PATH = shutil.which("sips") or "/usr/bin/sips"
+IMAGE_SIZE = "300"
 
 
 def e(value: object) -> str:
@@ -49,51 +80,88 @@ def parse_date(value: str) -> str:
     return value
 
 
+def col_index(ref: str) -> int:
+    col = "".join(ch for ch in ref if ch.isalpha())
+    result = 0
+    for ch in col:
+        result = result * 26 + ord(ch.upper()) - 64
+    return result - 1
+
+
+def shared_strings(zf: zipfile.ZipFile, ns: dict[str, str]) -> list[str]:
+    if "xl/sharedStrings.xml" not in zf.namelist():
+        return []
+    root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    result: list[str] = []
+    for item in root.findall("main:si", ns):
+        result.append("".join(node.text or "" for node in item.findall(".//main:t", ns)))
+    return result
+
+
+def workbook_sheet_xml(zf: zipfile.ZipFile, ns: dict[str, str]):
+    workbook = ET.fromstring(zf.read("xl/workbook.xml"))
+    rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+    rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels}
+    sheet = workbook.find("main:sheets", ns)[0]
+    rid = sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
+    return ET.fromstring(zf.read("xl/" + rel_map[rid]))
+
+
+def cell_value(cell, ns: dict[str, str], shared: list[str]) -> str:
+    cell_type = cell.attrib.get("t")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.findall(".//main:t", ns)).strip()
+    node = cell.find("main:v", ns)
+    if node is None:
+        return ""
+    raw = (node.text or "").strip()
+    if cell_type == "s" and raw.isdigit():
+        return shared[int(raw)].strip()
+    return raw
+
+
+def row_values(row, ns: dict[str, str], shared: list[str]) -> list[str]:
+    cells: dict[int, str] = {}
+    max_idx = -1
+    for cell in row.findall("main:c", ns):
+        idx = col_index(cell.attrib.get("r", "A1"))
+        max_idx = max(max_idx, idx)
+        cells[idx] = cell_value(cell, ns, shared)
+    return [cells.get(i, "") for i in range(max_idx + 1)]
+
+
 def xlsx_rows(path: Path) -> list[list[str]]:
     ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
     rows: list[list[str]] = []
 
-    def col_index(ref: str) -> int:
-        col = "".join(ch for ch in ref if ch.isalpha())
-        result = 0
-        for ch in col:
-            result = result * 26 + ord(ch.upper()) - 64
-        return result - 1
-
     with zipfile.ZipFile(path) as zf:
-        shared: list[str] = []
-        if "xl/sharedStrings.xml" in zf.namelist():
-            root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
-            for item in root.findall("main:si", ns):
-                shared.append("".join(node.text or "" for node in item.findall(".//main:t", ns)))
-
-        workbook = ET.fromstring(zf.read("xl/workbook.xml"))
-        rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
-        rel_map = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels}
-        sheet = workbook.find("main:sheets", ns)[0]
-        rid = sheet.attrib["{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"]
-        sheet_xml = ET.fromstring(zf.read("xl/" + rel_map[rid]))
-
+        shared = shared_strings(zf, ns)
+        sheet_xml = workbook_sheet_xml(zf, ns)
         for row in sheet_xml.findall(".//main:sheetData/main:row", ns):
-            cells: dict[int, str] = {}
-            max_idx = -1
-            for cell in row.findall("main:c", ns):
-                idx = col_index(cell.attrib.get("r", "A1"))
-                max_idx = max(max_idx, idx)
-                cell_type = cell.attrib.get("t")
-                value = ""
-                if cell_type == "inlineStr":
-                    value = "".join(node.text or "" for node in cell.findall(".//main:t", ns))
-                else:
-                    node = cell.find("main:v", ns)
-                    if node is not None:
-                        raw = node.text or ""
-                        value = shared[int(raw)] if cell_type == "s" and raw.isdigit() else raw
-                cells[idx] = value.strip()
-            result = [cells.get(i, "") for i in range(max_idx + 1)]
+            result = row_values(row, ns, shared)
             if any(part.strip() for part in result):
                 rows.append(result)
     return rows
+
+
+def copy_placeholder_image() -> None:
+    placeholder = IMPORT_DIR / PLACEHOLDER_IMAGE
+    target = IMAGES_DIR / PLACEHOLDER_IMAGE
+    if placeholder.exists() and not target.exists():
+        shutil.copy2(placeholder, target)
+
+
+def convert_import_images() -> None:
+    for file in IMPORT_DIR.glob("*.jpg"):
+        target = IMAGES_DIR / f"{file.stem}.png"
+        if target.exists():
+            continue
+        subprocess.run(
+            [SIPS_PATH, "-Z", IMAGE_SIZE, "-s", "format", "png", str(file), "--out", str(target)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
 
 
 def ensure_resources() -> None:
@@ -102,22 +170,11 @@ def ensure_resources() -> None:
         archive = next(Path.home().joinpath("Downloads").glob("Прил_2_ОЗ_КОД*.rar"), None)
         if archive is None:
             raise FileNotFoundError("Не найден архив с ресурсами в Downloads.")
-        subprocess.run(["bsdtar", "-xf", str(archive), "-C", str(RESOURCES_DIR)], check=True)
+        subprocess.run([BSDTAR_PATH, "-xf", str(archive), "-C", str(RESOURCES_DIR)], check=True)
 
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-    placeholder = IMPORT_DIR / "picture.png"
-    if placeholder.exists() and not (IMAGES_DIR / "picture.png").exists():
-        shutil.copy2(placeholder, IMAGES_DIR / "picture.png")
-
-    for file in IMPORT_DIR.glob("*.jpg"):
-        target = IMAGES_DIR / f"{file.stem}.png"
-        if not target.exists():
-            subprocess.run(
-                ["sips", "-Z", "300", "-s", "format", "png", str(file), "--out", str(target)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
+    copy_placeholder_image()
+    convert_import_images()
 
 
 def connect() -> sqlite3.Connection:
@@ -128,10 +185,99 @@ def connect() -> sqlite3.Connection:
 
 
 def get_or_create(conn: sqlite3.Connection, table: str, name: str) -> int:
+    if table not in LOOKUP_TABLES:
+        raise ValueError(f"Недопустимая таблица: {table}")
     row = conn.execute(f"SELECT id FROM {table} WHERE name = ?", (name,)).fetchone()
     if row:
         return int(row["id"])
     return int(conn.execute(f"INSERT INTO {table} (name) VALUES (?)", (name,)).lastrowid)
+
+
+def import_users(conn: sqlite3.Connection) -> None:
+    for row in xlsx_rows(IMPORT_DIR / "user_import.xlsx")[1:]:
+        if len(row) < 4 or not row[2]:
+            continue
+        role_id = get_or_create(conn, "roles", row[0].strip())
+        conn.execute(
+            "INSERT INTO users (full_name, login, password, role_id) VALUES (?, ?, ?, ?)",
+            (row[1].strip(), row[2].strip(), row[3].strip(), role_id),
+        )
+
+
+def product_image_path(image_name: str) -> str:
+    if not image_name.strip():
+        return str(IMAGES_DIR / PLACEHOLDER_IMAGE)
+    candidate = IMAGES_DIR / f"{Path(image_name).stem}.png"
+    if candidate.exists():
+        return str(candidate)
+    return str(IMAGES_DIR / PLACEHOLDER_IMAGE)
+
+
+def import_products(conn: sqlite3.Connection) -> None:
+    for row in xlsx_rows(IMPORT_DIR / "Tovar.xlsx")[1:]:
+        if len(row) < 11 or not row[0]:
+            continue
+        supplier_id = get_or_create(conn, "suppliers", row[4].strip())
+        manufacturer_id = get_or_create(conn, "manufacturers", row[5].strip())
+        category_id = get_or_create(conn, "categories", row[6].strip())
+        conn.execute(
+            """
+            INSERT INTO products (
+                article, name, unit, price, supplier_id, manufacturer_id, category_id,
+                discount_percent, stock_quantity, description, image_path
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row[0].strip(),
+                row[1].strip(),
+                row[2].strip(),
+                float(row[3] or 0),
+                supplier_id,
+                manufacturer_id,
+                category_id,
+                int(float(row[7] or 0)),
+                int(float(row[8] or 0)),
+                row[9].strip(),
+                product_image_path(row[10]),
+            ),
+        )
+
+
+def import_pickup_points(conn: sqlite3.Connection) -> None:
+    for row in xlsx_rows(IMPORT_DIR / "Пункты выдачи_import.xlsx"):
+        if row and row[0].strip():
+            conn.execute("INSERT INTO pickup_points (address) VALUES (?)", (row[0].strip(),))
+
+
+def import_orders(conn: sqlite3.Connection) -> None:
+    for row in xlsx_rows(IMPORT_DIR / "Заказ_import.xlsx")[1:]:
+        if len(row) < 8 or not row[0]:
+            continue
+        status_id = get_or_create(conn, "order_statuses", row[7].strip())
+        client = conn.execute("SELECT id FROM users WHERE full_name = ?", (row[5].strip(),)).fetchone()
+        order_id = int(float(row[0]))
+        conn.execute(
+            """
+            INSERT INTO orders (id, order_date, delivery_date, pickup_point_id, client_id, pickup_code, status_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order_id,
+                parse_date(row[2]),
+                parse_date(row[3]),
+                int(float(row[4])),
+                int(client["id"]) if client else None,
+                row[6].strip(),
+                status_id,
+            ),
+        )
+        for article, qty in parse_items(row[1]):
+            product = conn.execute("SELECT id FROM products WHERE article = ?", (article,)).fetchone()
+            if product:
+                conn.execute(
+                    "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)",
+                    (order_id, int(product["id"]), qty),
+                )
 
 
 def init_db(force: bool = False) -> None:
@@ -143,81 +289,10 @@ def init_db(force: bool = False) -> None:
 
     with connect() as conn:
         conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-
-        for row in xlsx_rows(IMPORT_DIR / "user_import.xlsx")[1:]:
-            if len(row) < 4 or not row[2]:
-                continue
-            role_id = get_or_create(conn, "roles", row[0].strip())
-            conn.execute(
-                "INSERT INTO users (full_name, login, password, role_id) VALUES (?, ?, ?, ?)",
-                (row[1].strip(), row[2].strip(), row[3].strip(), role_id),
-            )
-
-        for row in xlsx_rows(IMPORT_DIR / "Tovar.xlsx")[1:]:
-            if len(row) < 11 or not row[0]:
-                continue
-            supplier_id = get_or_create(conn, "suppliers", row[4].strip())
-            manufacturer_id = get_or_create(conn, "manufacturers", row[5].strip())
-            category_id = get_or_create(conn, "categories", row[6].strip())
-            image_path = IMAGES_DIR / "picture.png"
-            if row[10].strip():
-                candidate = IMAGES_DIR / f"{Path(row[10]).stem}.png"
-                if candidate.exists():
-                    image_path = candidate
-            conn.execute(
-                """
-                INSERT INTO products (
-                    article, name, unit, price, supplier_id, manufacturer_id, category_id,
-                    discount_percent, stock_quantity, description, image_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    row[0].strip(),
-                    row[1].strip(),
-                    row[2].strip(),
-                    float(row[3] or 0),
-                    supplier_id,
-                    manufacturer_id,
-                    category_id,
-                    int(float(row[7] or 0)),
-                    int(float(row[8] or 0)),
-                    row[9].strip(),
-                    str(image_path),
-                ),
-            )
-
-        for row in xlsx_rows(IMPORT_DIR / "Пункты выдачи_import.xlsx"):
-            if row and row[0].strip():
-                conn.execute("INSERT INTO pickup_points (address) VALUES (?)", (row[0].strip(),))
-
-        for row in xlsx_rows(IMPORT_DIR / "Заказ_import.xlsx")[1:]:
-            if len(row) < 8 or not row[0]:
-                continue
-            status_id = get_or_create(conn, "order_statuses", row[7].strip())
-            client = conn.execute("SELECT id FROM users WHERE full_name = ?", (row[5].strip(),)).fetchone()
-            order_id = int(float(row[0]))
-            conn.execute(
-                """
-                INSERT INTO orders (id, order_date, delivery_date, pickup_point_id, client_id, pickup_code, status_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    order_id,
-                    parse_date(row[2]),
-                    parse_date(row[3]),
-                    int(float(row[4])),
-                    int(client["id"]) if client else None,
-                    row[6].strip(),
-                    status_id,
-                ),
-            )
-            for article, qty in parse_items(row[1]):
-                product = conn.execute("SELECT id FROM products WHERE article = ?", (article,)).fetchone()
-                if product:
-                    conn.execute(
-                        "INSERT INTO order_items (order_id, product_id, quantity) VALUES (?, ?, ?)",
-                        (order_id, int(product["id"]), qty),
-                    )
+        import_users(conn)
+        import_products(conn)
+        import_pickup_points(conn)
+        import_orders(conn)
         conn.commit()
 
 
@@ -329,11 +404,15 @@ def page(title: str, content: str, message: str = "", error: bool = False) -> by
     return html_doc.encode("utf-8")
 
 
+def product_access_html() -> bytes:
+    return page("Ошибка", FORBIDDEN_BODY, FORBIDDEN_TEXT, True)
+
+
 def nav(user: dict[str, object] | None, title: str) -> str:
     if not user:
         return f'<div class="top"><h1 style="margin:0">{e(title)}</h1></div>'
     orders_btn = ""
-    if str(user["role_name"]) in {"Менеджер", "Администратор"}:
+    if str(user["role_name"]) in MANAGER_ROLES:
         orders_btn = '<a class="btn gray" href="/orders">Заказы</a>'
     return f"""
     <div class="top">
@@ -392,16 +471,127 @@ def render_login(message: str = "", error: bool = False) -> bytes:
 
 
 def product_image_url(path: str) -> str:
-    return "/media/" + urllib.parse.quote(Path(path).name)
+    return MEDIA_PREFIX + urllib.parse.quote(Path(path).name)
+
+
+def filter_products(products: list[sqlite3.Row], search: str) -> list[sqlite3.Row]:
+    words = [word.casefold() for word in search.strip().split() if word]
+    if not words:
+        return products
+    filtered_products = []
+    for product in products:
+        haystack = " ".join(
+            [
+                str(product["article"]),
+                str(product["name"]),
+                str(product["unit"]),
+                str(product["description"]),
+                str(product["supplier_name"]),
+                str(product["manufacturer_name"]),
+                str(product["category_name"]),
+            ]
+        ).casefold()
+        if all(word in haystack for word in words):
+            filtered_products.append(product)
+    return filtered_products
+
+
+def supplier_options(suppliers: list[str], supplier: str) -> str:
+    options = '<option value="Все поставщики">Все поставщики</option>'
+    for item in suppliers:
+        selected = "selected" if item == supplier else ""
+        options += f'<option value="{e(item)}" {selected}>{e(item)}</option>'
+    return options
+
+
+def product_price_html(product: sqlite3.Row) -> str:
+    if int(product["discount_percent"]) <= 0:
+        return f"{float(product['price']):.2f} руб."
+    final_price = float(product["price"]) * (100 - int(product["discount_percent"])) / 100
+    return (
+        f'<span class="old-price">{float(product["price"]):.2f} руб.</span>'
+        f'<span class="new-price">{final_price:.2f} руб.</span>'
+    )
+
+
+def product_actions_html(product: sqlite3.Row, can_edit: bool) -> str:
+    if not can_edit:
+        return ""
+    return f"""
+    <div class="row">
+      <a class="btn gray" href="/product/edit?id={product['id']}">Редактировать</a>
+      <form method="post" action="/product/delete" onsubmit="return confirm('Удалить товар?')" style="margin:0">
+        <input type="hidden" name="id" value="{product['id']}">
+        <button type="submit">Удалить</button>
+      </form>
+    </div>
+    """
+
+
+def product_card_html(product: sqlite3.Row, can_edit: bool) -> str:
+    discount_cls = "discount high" if int(product["discount_percent"]) > 15 else "discount"
+    card_cls = "card out-of-stock" if int(product["stock_quantity"]) == 0 else "card"
+    return f"""
+    <div class="{card_cls}">
+      <div class="grid">
+        <div><img class="product" src="{product_image_url(product['image_path'])}" alt=""></div>
+        <div>
+          <h2 style="margin-top:0">{e(product['name'])} ({e(product['article'])})</h2>
+          <div>Категория: {e(product['category_name'])}</div>
+          <div>Производитель: {e(product['manufacturer_name'])}</div>
+          <div>Поставщик: {e(product['supplier_name'])}</div>
+          <div>Ед. изм.: {e(product['unit'])}</div>
+          <div>Цена: {product_price_html(product)}</div>
+          <div>Количество на складе: {e(product['stock_quantity'])}</div>
+          <div class="{discount_cls}">Скидка: {e(product['discount_percent'])}%</div>
+          <p>{e(product['description'])}</p>
+          {product_actions_html(product, can_edit)}
+        </div>
+      </div>
+    </div>
+    """
+
+
+def product_filters_html(search: str, supplier: str, sort: str, can_edit: bool, suppliers: list[str]) -> str:
+    options = supplier_options(suppliers, supplier)
+    add_product_btn = "<div><br><a class='btn' href='/product/new'>Добавить товар</a></div>" if can_edit else ""
+    return f"""
+    <div class="panel">
+      <form method="get" id="filterForm">
+        <div class="row">
+          <div style="flex:1;min-width:220px"><label>Поиск<br><input name="search" value="{e(search)}" id="searchInput"></label></div>
+          <div style="flex:1;min-width:220px"><label>Поставщик<br><select name="supplier" id="supplierInput">{options}</select></label></div>
+          <div style="flex:1;min-width:220px"><label>Сортировка<br>
+            <select name="sort" id="sortInput">
+              <option value="">Без сортировки</option>
+              <option value="asc" {"selected" if sort == "asc" else ""}>По возрастанию остатка</option>
+              <option value="desc" {"selected" if sort == "desc" else ""}>По убыванию остатка</option>
+            </select>
+          </label></div>
+          {add_product_btn}
+        </div>
+      </form>
+    </div>
+    <script>
+    let t;
+    function autoSend() {{
+      clearTimeout(t);
+      t = setTimeout(() => document.getElementById('filterForm').submit(), 500);
+    }}
+    document.getElementById('searchInput').addEventListener('input', autoSend);
+    document.getElementById('supplierInput').addEventListener('change', autoSend);
+    document.getElementById('sortInput').addEventListener('change', autoSend);
+    </script>
+    """
 
 
 def product_list_html(user: dict[str, object] | None, query: dict[str, str]) -> str:
-    role = str(user["role_name"]) if user else "Гость"
+    role = str(user["role_name"]) if user else ROLE_GUEST
     search = query.get("search", "")
     supplier = query.get("supplier", "")
     sort = query.get("sort", "")
-    can_filter = role in {"Менеджер", "Администратор"}
-    can_edit = role == "Администратор"
+    can_filter = role in MANAGER_ROLES
+    can_edit = role == ROLE_ADMIN
 
     sql = """
     SELECT products.id, products.article, products.name, products.unit, products.price,
@@ -428,104 +618,17 @@ def product_list_html(user: dict[str, object] | None, query: dict[str, str]) -> 
         products = conn.execute(sql, params).fetchall()
         suppliers = [row["name"] for row in conn.execute("SELECT name FROM suppliers ORDER BY name").fetchall()]
 
-    if can_filter and search.strip():
-        words = [word.casefold() for word in search.strip().split() if word]
-        filtered_products = []
-        for product in products:
-            haystack = " ".join(
-                [
-                    str(product["article"]),
-                    str(product["name"]),
-                    str(product["unit"]),
-                    str(product["description"]),
-                    str(product["supplier_name"]),
-                    str(product["manufacturer_name"]),
-                    str(product["category_name"]),
-                ]
-            ).casefold()
-            if all(word in haystack for word in words):
-                filtered_products.append(product)
-        products = filtered_products
-
-    filters = ""
     if can_filter:
-        options = '<option value="Все поставщики">Все поставщики</option>'
-        for item in suppliers:
-            selected = "selected" if item == supplier else ""
-            options += f'<option value="{e(item)}" {selected}>{e(item)}</option>'
-        filters = f"""
-        <div class="panel">
-          <form method="get" id="filterForm">
-            <div class="row">
-              <div style="flex:1;min-width:220px"><label>Поиск<br><input name="search" value="{e(search)}" id="searchInput"></label></div>
-              <div style="flex:1;min-width:220px"><label>Поставщик<br><select name="supplier" id="supplierInput">{options}</select></label></div>
-              <div style="flex:1;min-width:220px"><label>Сортировка<br>
-                <select name="sort" id="sortInput">
-                  <option value="">Без сортировки</option>
-                  <option value="asc" {"selected" if sort == "asc" else ""}>По возрастанию остатка</option>
-                  <option value="desc" {"selected" if sort == "desc" else ""}>По убыванию остатка</option>
-                </select>
-              </label></div>
-              {"<div><br><a class='btn' href='/product/new'>Добавить товар</a></div>" if can_edit else ""}
-            </div>
-          </form>
-        </div>
-        <script>
-        let t;
-        function autoSend() {{
-          clearTimeout(t);
-          t = setTimeout(() => document.getElementById('filterForm').submit(), 500);
-        }}
-        document.getElementById('searchInput').addEventListener('input', autoSend);
-        document.getElementById('supplierInput').addEventListener('change', autoSend);
-        document.getElementById('sortInput').addEventListener('change', autoSend);
-        </script>
-        """
+        products = filter_products(products, search)
+
+    if can_filter:
+        filters = product_filters_html(search, supplier, sort, can_edit, suppliers)
     elif can_edit:
         filters = '<div class="panel"><a class="btn" href="/product/new">Добавить товар</a></div>'
+    else:
+        filters = ""
 
-    cards = ""
-    for product in products:
-        discount_cls = "discount high" if int(product["discount_percent"]) > 15 else "discount"
-        card_cls = "card out-of-stock" if int(product["stock_quantity"]) == 0 else "card"
-        price_html = f"{float(product['price']):.2f} руб."
-        if int(product["discount_percent"]) > 0:
-            final_price = float(product["price"]) * (100 - int(product["discount_percent"])) / 100
-            price_html = (
-                f'<span class="old-price">{float(product["price"]):.2f} руб.</span>'
-                f'<span class="new-price">{final_price:.2f} руб.</span>'
-            )
-        actions = ""
-        if can_edit:
-            actions = f"""
-            <div class="row">
-              <a class="btn gray" href="/product/edit?id={product['id']}">Редактировать</a>
-              <form method="post" action="/product/delete" onsubmit="return confirm('Удалить товар?')" style="margin:0">
-                <input type="hidden" name="id" value="{product['id']}">
-                <button type="submit">Удалить</button>
-              </form>
-            </div>
-            """
-        cards += f"""
-        <div class="{card_cls}">
-          <div class="grid">
-            <div><img class="product" src="{product_image_url(product['image_path'])}" alt=""></div>
-            <div>
-              <h2 style="margin-top:0">{e(product['name'])} ({e(product['article'])})</h2>
-              <div>Категория: {e(product['category_name'])}</div>
-              <div>Производитель: {e(product['manufacturer_name'])}</div>
-              <div>Поставщик: {e(product['supplier_name'])}</div>
-              <div>Ед. изм.: {e(product['unit'])}</div>
-              <div>Цена: {price_html}</div>
-              <div>Количество на складе: {e(product['stock_quantity'])}</div>
-              <div class="{discount_cls}">Скидка: {e(product['discount_percent'])}%</div>
-              <p>{e(product['description'])}</p>
-              {actions}
-            </div>
-          </div>
-        </div>
-        """
-
+    cards = "".join(product_card_html(product, can_edit) for product in products)
     return nav(user, "Список товаров") + filters + f'<div class="products">{cards}</div>'
 
 
@@ -765,6 +868,42 @@ def order_table_html(user: dict[str, object]) -> str:
 
 
 def render_order_form(user: dict[str, object], order_id: int | None, message: str = "", error: bool = False) -> bytes:
+    order, next_id, next_code, statuses, points, clients, items = order_form_data(order_id)
+    status_options = "".join(
+        f'<option value="{e(name)}" {"selected" if order and order["status_name"].strip() == name else ""}>{e(name)}</option>'
+        for name in statuses
+    )
+    point_options = "".join(
+        f'<option value="{row["id"]}" {"selected" if order and int(order["pickup_point_id"]) == row["id"] else ""}>{e(row["address"])}</option>'
+        for row in points
+    )
+    client_options = '<option value="">Не выбран</option>' + "".join(
+        f'<option value="{row["id"]}" {"selected" if order and order["client_id"] == row["id"] else ""}>{e(row["full_name"])}</option>'
+        for row in clients
+    )
+    content = nav(user, "Добавление заказа" if order is None else "Редактирование заказа") + f"""
+    <div class="panel">
+      <form method="post" action="/order/save">
+        <input type="hidden" name="id" value="{e(order['id'] if order else '')}">
+        <p><label>Номер заказа<br><input value="{e(order['id'] if order else next_id)}" readonly></label></p>
+        <p><label>Артикул<br><input name="items" value="{e(items)}" required></label></p>
+        <p><label>Статус заказа<br><select name="status_name" required>{status_options}</select></label></p>
+        <p><label>Адрес пункта выдачи<br><select name="pickup_point_id" required>{point_options}</select></label></p>
+        <p><label>Дата заказа<br><input name="order_date" value="{e(order['order_date'] if order else datetime.now().strftime('%Y-%m-%d'))}" required></label></p>
+        <p><label>Дата выдачи<br><input name="delivery_date" value="{e(order['delivery_date'] if order else datetime.now().strftime('%Y-%m-%d'))}" required></label></p>
+        <p><label>Клиент<br><select name="client_id">{client_options}</select></label></p>
+        <p><label>Код получения<br><input name="pickup_code" value="{e(order['pickup_code'] if order else next_code)}" required></label></p>
+        <div class="row">
+          <button type="submit">Сохранить</button>
+          <a class="btn gray" href="/orders">Отмена</a>
+        </div>
+      </form>
+    </div>
+    """
+    return page("Заказ", content, message, error)
+
+
+def order_form_data(order_id: int | None):
     with connect() as conn:
         order = None
         if order_id is not None:
@@ -803,39 +942,7 @@ def render_order_form(user: dict[str, object], order_id: int | None, message: st
                 (order_id,),
             ).fetchall()
             items = ", ".join(f"{row['article']}, {row['quantity']}" for row in parts)
-
-    status_options = "".join(
-        f'<option value="{e(name)}" {"selected" if order and order["status_name"].strip() == name else ""}>{e(name)}</option>'
-        for name in statuses
-    )
-    point_options = "".join(
-        f'<option value="{row["id"]}" {"selected" if order and int(order["pickup_point_id"]) == row["id"] else ""}>{e(row["address"])}</option>'
-        for row in points
-    )
-    client_options = '<option value="">Не выбран</option>' + "".join(
-        f'<option value="{row["id"]}" {"selected" if order and order["client_id"] == row["id"] else ""}>{e(row["full_name"])}</option>'
-        for row in clients
-    )
-    content = nav(user, "Добавление заказа" if order is None else "Редактирование заказа") + f"""
-    <div class="panel">
-      <form method="post" action="/order/save">
-        <input type="hidden" name="id" value="{e(order['id'] if order else '')}">
-        <p><label>Номер заказа<br><input value="{e(order['id'] if order else next_id)}" readonly></label></p>
-        <p><label>Артикул<br><input name="items" value="{e(items)}" required></label></p>
-        <p><label>Статус заказа<br><select name="status_name" required>{status_options}</select></label></p>
-        <p><label>Адрес пункта выдачи<br><select name="pickup_point_id" required>{point_options}</select></label></p>
-        <p><label>Дата заказа<br><input name="order_date" value="{e(order['order_date'] if order else datetime.now().strftime('%Y-%m-%d'))}" required></label></p>
-        <p><label>Дата выдачи<br><input name="delivery_date" value="{e(order['delivery_date'] if order else datetime.now().strftime('%Y-%m-%d'))}" required></label></p>
-        <p><label>Клиент<br><select name="client_id">{client_options}</select></label></p>
-        <p><label>Код получения<br><input name="pickup_code" value="{e(order['pickup_code'] if order else next_code)}" required></label></p>
-        <div class="row">
-          <button type="submit">Сохранить</button>
-          <a class="btn gray" href="/orders">Отмена</a>
-        </div>
-      </form>
-    </div>
-    """
-    return page("Заказ", content, message, error)
+    return order, next_id, next_code, statuses, points, clients, items
 
 
 def save_order(data: dict[str, str]) -> None:
@@ -900,6 +1007,153 @@ class Server(ThreadingMixIn, WSGIServer):
     daemon_threads = True
 
 
+def access_denied(start_response):
+    return respond(start_response, product_access_html(), FORBIDDEN_STATUS)
+
+
+def parse_entity_id(data: dict[str, str]) -> int | None:
+    if not data.get("id", "").strip():
+        return None
+    return int(data["id"])
+
+
+def handle_login_get(start_response):
+    return respond(start_response, render_login())
+
+
+def handle_login_post(environ: dict[str, object], start_response):
+    data = body_data(environ)
+    with connect() as conn:
+        found = conn.execute(
+            """
+            SELECT users.id, users.full_name, roles.name role_name
+            FROM users JOIN roles ON roles.id = users.role_id
+            WHERE users.login = ? AND users.password = ?
+            """,
+            (data.get("login", "").strip(), data.get("password", "").strip()),
+        ).fetchone()
+    if not found:
+        return respond(start_response, render_login("Неверный логин или пароль.", True))
+    return redirect(start_response, PRODUCTS_PATH, [("Set-Cookie", login_user(found))])
+
+
+def handle_guest_login(start_response):
+    guest = {"id": None, "full_name": ROLE_GUEST, "role_name": ROLE_GUEST}
+    return redirect(start_response, PRODUCTS_PATH, [("Set-Cookie", login_user(guest))])
+
+
+def handle_products_page(start_response, user: dict[str, object] | None, query: dict[str, str]):
+    body = product_list_html(user, query)
+    return respond(start_response, page("Товары", body, query.get("message", ""), bool(query.get("error"))))
+
+
+def handle_product_form(start_response, user: dict[str, object], query: dict[str, str], product_id: int | None = None):
+    if not require(user, ADMIN_ONLY):
+        return access_denied(start_response)
+    if product_id is None:
+        return respond(start_response, render_product_form(user, None))
+    return respond(start_response, render_product_form(user, int(query.get("id", "0") or 0)))
+
+
+def handle_product_save(environ: dict[str, object], start_response, user: dict[str, object]):
+    if not require(user, ADMIN_ONLY):
+        return access_denied(start_response)
+    data = body_data(environ)
+    try:
+        save_product(data)
+        return redirect(start_response, PRODUCT_ITEM_MESSAGE_PREFIX + urllib.parse.quote("Товар сохранен."))
+    except (ValueError, TypeError, sqlite3.Error, OSError) as error:
+        return respond(start_response, render_product_form(user, parse_entity_id(data), str(error), True))
+
+
+def handle_product_delete(environ: dict[str, object], start_response, user: dict[str, object]):
+    if not require(user, ADMIN_ONLY):
+        return access_denied(start_response)
+    data = body_data(environ)
+    try:
+        delete_product(int(data["id"]))
+        return redirect(start_response, PRODUCT_ITEM_MESSAGE_PREFIX + urllib.parse.quote("Товар удален."))
+    except (ValueError, TypeError, sqlite3.Error, OSError) as error:
+        return redirect(start_response, PRODUCT_ITEM_MESSAGE_PREFIX + urllib.parse.quote(str(error)) + "&error=1")
+
+
+def handle_orders_page(start_response, user: dict[str, object], query: dict[str, str]):
+    if not require(user, MANAGER_ROLES):
+        return access_denied(start_response)
+    return respond(start_response, page("Заказы", order_table_html(user), query.get("message", ""), bool(query.get("error"))))
+
+
+def handle_order_form(start_response, user: dict[str, object], query: dict[str, str], order_id: int | None = None):
+    if not require(user, ADMIN_ONLY):
+        return access_denied(start_response)
+    if order_id is None:
+        return respond(start_response, render_order_form(user, None))
+    return respond(start_response, render_order_form(user, int(query.get("id", "0") or 0)))
+
+
+def handle_order_save(environ: dict[str, object], start_response, user: dict[str, object]):
+    if not require(user, ADMIN_ONLY):
+        return access_denied(start_response)
+    data = body_data(environ)
+    try:
+        save_order(data)
+        return redirect(start_response, ORDER_ITEM_MESSAGE_PREFIX + urllib.parse.quote("Заказ сохранен."))
+    except (ValueError, TypeError, sqlite3.Error) as error:
+        return respond(start_response, render_order_form(user, parse_entity_id(data), str(error), True))
+
+
+def handle_order_delete(environ: dict[str, object], start_response, user: dict[str, object]):
+    if not require(user, ADMIN_ONLY):
+        return access_denied(start_response)
+    data = body_data(environ)
+    delete_order(int(data["id"]))
+    return redirect(start_response, ORDER_ITEM_MESSAGE_PREFIX + urllib.parse.quote("Заказ удален."))
+
+
+def media_response(start_response, path: str):
+    name = urllib.parse.unquote(path.split(MEDIA_PREFIX, 1)[1])
+    for folder in (IMAGES_DIR, IMPORT_DIR):
+        file = folder / name
+        if file.exists():
+            mime = "image/png"
+            if file.suffix.lower() in {".jpg", ".jpeg"}:
+                mime = "image/jpeg"
+            elif file.suffix.lower() == ".ico":
+                mime = "image/x-icon"
+            start_response("200 OK", [("Content-Type", mime)])
+            return [file.read_bytes()]
+    start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+    return [b"not found"]
+
+
+def exact_route_response(
+    method: str,
+    path: str,
+    environ: dict[str, object],
+    start_response,
+    user: dict[str, object] | None,
+    query: dict[str, str],
+):
+    routes: dict[tuple[str, str], Callable[[], list[bytes]]] = {
+        ("GET", LOGIN_PATH): lambda: handle_login_get(start_response),
+        ("POST", LOGIN_PATH): lambda: handle_login_post(environ, start_response),
+        ("GET", "/guest"): lambda: handle_guest_login(start_response),
+        ("GET", "/logout"): lambda: redirect(start_response, LOGIN_PATH, [("Set-Cookie", logout_cookie())]),
+        ("GET", PRODUCTS_PATH): lambda: handle_products_page(start_response, user, query),
+        ("GET", ORDERS_PATH): lambda: handle_orders_page(start_response, user, query),
+        ("GET", "/product/new"): lambda: handle_product_form(start_response, user, query),
+        ("GET", "/product/edit"): lambda: handle_product_form(start_response, user, query, 1),
+        ("POST", "/product/save"): lambda: handle_product_save(environ, start_response, user),
+        ("POST", "/product/delete"): lambda: handle_product_delete(environ, start_response, user),
+        ("GET", "/order/new"): lambda: handle_order_form(start_response, user, query),
+        ("GET", "/order/edit"): lambda: handle_order_form(start_response, user, query, 1),
+        ("POST", "/order/save"): lambda: handle_order_save(environ, start_response, user),
+        ("POST", "/order/delete"): lambda: handle_order_delete(environ, start_response, user),
+    }
+    handler = routes.get((method, path))
+    return handler() if handler else None
+
+
 def app(environ: dict[str, object], start_response):  # type: ignore[no-untyped-def]
     method = str(environ["REQUEST_METHOD"])
     path = str(environ.get("PATH_INFO", "/"))
@@ -907,115 +1161,14 @@ def app(environ: dict[str, object], start_response):  # type: ignore[no-untyped-
     user = current_user(environ)
 
     if path == "/":
-        return redirect(start_response, "/products" if user else "/login")
+        return redirect(start_response, PRODUCTS_PATH if user else LOGIN_PATH)
 
-    if path == "/login" and method == "GET":
-        return respond(start_response, render_login())
+    route_response = exact_route_response(method, path, environ, start_response, user, query)
+    if route_response is not None:
+        return route_response
 
-    if path == "/login" and method == "POST":
-        data = body_data(environ)
-        with connect() as conn:
-            found = conn.execute(
-                """
-                SELECT users.id, users.full_name, roles.name role_name
-                FROM users JOIN roles ON roles.id = users.role_id
-                WHERE users.login = ? AND users.password = ?
-                """,
-                (data.get("login", "").strip(), data.get("password", "").strip()),
-            ).fetchone()
-        if not found:
-            return respond(start_response, render_login("Неверный логин или пароль.", True))
-        return redirect(start_response, "/products", [("Set-Cookie", login_user(found))])
-
-    if path == "/guest":
-        guest = {"id": None, "full_name": "Гость", "role_name": "Гость"}
-        return redirect(start_response, "/products", [("Set-Cookie", login_user(guest))])
-
-    if path == "/logout":
-        return redirect(start_response, "/login", [("Set-Cookie", logout_cookie())])
-
-    if path == "/products":
-        body = product_list_html(user, query)
-        return respond(start_response, page("Товары", body, query.get("message", ""), bool(query.get("error"))))
-
-    if path == "/product/new":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        return respond(start_response, render_product_form(user, None))
-
-    if path == "/product/edit":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        return respond(start_response, render_product_form(user, int(query.get("id", "0") or 0)))
-
-    if path == "/product/save" and method == "POST":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        data = body_data(environ)
-        try:
-            save_product(data)
-            return redirect(start_response, "/products?message=" + urllib.parse.quote("Товар сохранен."))
-        except Exception as error:
-            product_id = int(data["id"]) if data.get("id", "").strip() else None
-            return respond(start_response, render_product_form(user, product_id, str(error), True))
-
-    if path == "/product/delete" and method == "POST":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        data = body_data(environ)
-        try:
-            delete_product(int(data["id"]))
-            return redirect(start_response, "/products?message=" + urllib.parse.quote("Товар удален."))
-        except Exception as error:
-            return redirect(start_response, "/products?message=" + urllib.parse.quote(str(error)) + "&error=1")
-
-    if path == "/orders":
-        if not require(user, {"Менеджер", "Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        return respond(start_response, page("Заказы", order_table_html(user), query.get("message", ""), bool(query.get("error"))))
-
-    if path == "/order/new":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        return respond(start_response, render_order_form(user, None))
-
-    if path == "/order/edit":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        return respond(start_response, render_order_form(user, int(query.get("id", "0") or 0)))
-
-    if path == "/order/save" and method == "POST":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        data = body_data(environ)
-        try:
-            save_order(data)
-            return redirect(start_response, "/orders?message=" + urllib.parse.quote("Заказ сохранен."))
-        except Exception as error:
-            order_id = int(data["id"]) if data.get("id", "").strip() else None
-            return respond(start_response, render_order_form(user, order_id, str(error), True))
-
-    if path == "/order/delete" and method == "POST":
-        if not require(user, {"Администратор"}):
-            return respond(start_response, page("Ошибка", "<div class='panel'>Нет доступа.</div>", "Нет доступа.", True), "403 Forbidden")
-        data = body_data(environ)
-        delete_order(int(data["id"]))
-        return redirect(start_response, "/orders?message=" + urllib.parse.quote("Заказ удален."))
-
-    if path.startswith("/media/"):
-        name = urllib.parse.unquote(path.split("/media/", 1)[1])
-        for folder in (IMAGES_DIR, IMPORT_DIR):
-            file = folder / name
-            if file.exists():
-                mime = "image/png"
-                if file.suffix.lower() in {".jpg", ".jpeg"}:
-                    mime = "image/jpeg"
-                elif file.suffix.lower() == ".ico":
-                    mime = "image/x-icon"
-                start_response("200 OK", [("Content-Type", mime)])
-                return [file.read_bytes()]
-        start_response("404 Not Found", [("Content-Type", "text/plain; charset=utf-8")])
-        return [b"not found"]
+    if path.startswith(MEDIA_PREFIX):
+        return media_response(start_response, path)
 
     return respond(start_response, page("404", "<div class='panel'>Страница не найдена.</div>", "Страница не найдена.", True), "404 Not Found")
 
@@ -1026,8 +1179,8 @@ def run_server(host: str, port: int, open_browser: bool) -> None:
     if open_browser:
         try:
             webbrowser.open(url)
-        except Exception:
-            pass
+        except webbrowser.Error:
+            print("Не удалось открыть браузер автоматически.")
     with make_server(host, port, app, server_class=Server) as httpd:
         httpd.serve_forever()
 
